@@ -1,0 +1,116 @@
+cc_library_shared {
+    name: "libfvdenoise",
+
+    vendor_available: true,
+    vndk: {
+        enabled: true,
+    },
+    double_loadable: true,
+    arch: {
+        arm: {
+            instruction_set: "arm",
+
+            neon: {
+                cflags: ["-D_USE_NEON"],
+            },
+        },
+    },
+    srcs: ["src/denoise.c",
+		   "src/rnn.c",
+           "src/pitch.c",
+	       "src/kiss_fft.c",
+	       "src/celt_lpc.c",
+	       "src/nnet.c",
+	       "src/nnet_default.c", 
+	       "src/parse_lpcnet_weights.c", 
+	       "src/rnnoise_data.c", 
+	       "src/rnnoise_tables.c"],
+
+    cflags: [
+        "-DEXPORT=__attribute__((visibility(\"default\")))",
+        "-DFLOATING_POINT",
+        "-DHAVE_STDINT_H",
+        "-O3",
+        "-fstrict-aliasing",
+        "-fprefetch-loop-arrays",
+        "-Wall",
+        "-march=armv7-a",        
+        "-mfloat-abi=softfp",    
+        "-mfpu=neon",            
+        "-mthumb",               
+        "-mfpu=neon-fp-armv8",
+        "-Werror",
+        "-Wno-sign-compare",
+        "-Wno-unused-parameter",
+    ],
+
+    local_include_dirs: ["src"],
+    export_include_dirs: ["include"],
+    sanitize: {
+        integer_overflow: true,
+        misc_undefined: ["bounds"],
+    },
+}
+
+cc_library_static {
+    name: "libfvdenoise_static",
+
+    vendor: true,
+    arch: {
+        arm: {
+            instruction_set: "arm",
+			
+			neon: {
+                cflags: ["-D_USE_NEON"],
+            },
+        },
+    },
+    srcs: ["src/denoise.c",
+		   "src/rnn.c",
+           "src/pitch.c",
+	       "src/kiss_fft.c",
+	       "src/celt_lpc.c",
+	       "src/nnet.c",
+	       "src/nnet_default.c", 
+	       "src/parse_lpcnet_weights.c", 
+	       "src/rnnoise_data.c", 
+	       "src/rnnoise_tables.c"],
+
+    cflags: [
+        "-DEXPORT=__attribute__((visibility(\"default\")))",
+        "-DFLOATING_POINT",
+        "-DHAVE_STDINT_H",
+        "-O3",
+        "-fstrict-aliasing",
+        "-fprefetch-loop-arrays",
+        "-Wall",
+        "-march=armv7-a",        
+        "-mfloat-abi=softfp",    
+        "-mfpu=neon",            
+        "-mthumb",               
+        "-mfpu=neon-fp-armv8", 
+        "-Werror",
+        "-Wno-sign-compare",
+        "-Wno-unused-parameter",
+    ],
+
+    local_include_dirs: ["src"],
+    export_include_dirs: ["include"],
+    sanitize: {
+        integer_overflow: true,
+        misc_undefined: ["bounds"],
+    },
+}
+
+cc_binary {
+    name: "rnnoise_demo",
+    srcs: ["examples/rnnoise_demo.c"],  
+    static_libs: ["libfvdenoise_static"],  
+	vendor: true,
+   
+    cflags: [
+        "-O2", 
+        "-Wall",
+    ],
+    local_include_dirs: ["include"],  
+}

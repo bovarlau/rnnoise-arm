@@ -80,6 +80,12 @@ struct DenoiseState {
   int last_period;
   float mem_hp_x[2];
   float lastg[NB_BANDS];
+  float vad_smooth;
+  float vad_hist[2];
+  int howl_count[NB_BANDS];
+  int howl_fast[NB_BANDS];
+  int howl_bin[NB_BANDS];
+  int howl_mode_timer;
   RNNState rnn;
   kiss_fft_cpx delayed_X[FREQ_SIZE];
   kiss_fft_cpx delayed_P[FREQ_SIZE];
@@ -494,16 +500,107 @@ float rnnoise_process_frame(DenoiseState *st, float *out, const float *in) {
     //total_rnn_time += (double)(end_rnn - start_rnn) / CLOCKS_PER_SEC;
     //printf("compute_rnn time: %.6f seconds\n", total_rnn_time);
 
-    // VAD protection: when vad_prob is high but g is small, RNN may misjudge speech as noise
-    // Blend g toward 1.0 (no suppression) proportional to vad_prob
-    printf("vad_prob = %.6f \n", vad_prob);
-    if (vad_prob > 0.1f) {
-        float protect = (vad_prob - 0.1f) * (1.0f/0.9f);  // [0.1~1.0] -> [0~1]
-        for (i = 0; i < NB_BANDS; i++) {
-            g[i] = g[i] * (1 - protect) + protect;
+    /* Howling (acoustic feedback) detector.
+       A feedback squeal is a loud narrowband peak that stays on (nearly) the
+       same FFT bin for hundreds of ms, unlike speech harmonics whose frequency
+       keeps moving with the pitch.  Per band (above ~1 kHz), count consecutive
+       frames where a single bin (+/-1) dominates the band and the band is a
+       significant part of the frame energy.  Once any band confirms a squeal,
+       enter "howl mode" for a few seconds: howling happens when units are
+       close (high loop gain), which never coincides with far-field speech, so
+       during howl mode the speech protection below is disabled for all bands
+       above ~1 kHz and the model's own gains (~0 for feedback tones) apply.
+       While in howl mode, re-arming the timer only needs a short stable run,
+       so squeal bursts that hop a few bins keep the mode latched.
+       A second, fast trigger path handles loud squeals: a stable narrow peak
+       that alone holds >40% of the whole frame energy while the model gives
+       that band ~0 gain cannot be speech (validated against far-field speech
+       harmonics, which stay below ~30%), so 4 such frames (40 ms) are enough
+       to confirm. */
+#define HOWL_FIRST_BAND 8  /* only look above ~1.05 kHz; lower bands hold sustained vowels */
+#define HOWL_TRIG 26       /* ~260 ms of stable narrow peak confirms howling
+                              (longest such run measured on speech: 250 ms) */
+#define HOWL_RETRIG 10     /* while in howl mode, ~100 ms re-arms the timer */
+#define HOWL_HOLD 300      /* howl mode lasts >= 3 s past the last confirmation */
+#define HOWL_COUNT_MAX 100
+#define HOWL_FAST_DOM 0.4f /* fast path: peak alone exceeds 40% of frame energy */
+#define HOWL_FAST_G 0.05f  /* fast path: model must agree the band is noise */
+#define HOWL_FAST_TRIG 4   /* fast path: 40 ms */
+    {
+      int any_trig = 0;
+      int th = st->howl_mode_timer > 0 ? HOWL_RETRIG : HOWL_TRIG;
+      float Etot = 1e-9f;
+      for (i=0;i<NB_BANDS;i++) Etot += Ex[i];
+      for (i=HOWL_FIRST_BAND;i<NB_BANDS;i++) {
+        int j, lo = eband20ms[i+1], hi = eband20ms[i+2];
+        int pkb = lo, narrow, stable;
+        float be = 1e-15f, maxbin = 0, pe;
+        for (j=lo;j<hi;j++) {
+          float e = SQUARE(X[j].r) + SQUARE(X[j].i);
+          be += e;
+          if (e > maxbin) { maxbin = e; pkb = j; }
         }
+        pe = maxbin;
+        if (pkb-1 >= lo) pe += SQUARE(X[pkb-1].r) + SQUARE(X[pkb-1].i);
+        if (pkb+1 < hi)  pe += SQUARE(X[pkb+1].r) + SQUARE(X[pkb+1].i);
+        narrow = (be > .02f*Etot) && (pe > .7f*be);
+        stable = narrow && pkb - st->howl_bin[i] <= 1 && pkb - st->howl_bin[i] >= -1;
+        if (stable) {
+          if (st->howl_count[i] < HOWL_COUNT_MAX) st->howl_count[i]++;
+        } else if (narrow) {
+          /* still a narrow peak, but it jumped bins: decay softly so an
+             established count survives small frequency hops */
+          st->howl_count[i] -= 1;
+          if (st->howl_count[i] < 0) st->howl_count[i] = 0;
+        } else {
+          st->howl_count[i] -= 2;
+          if (st->howl_count[i] < 0) st->howl_count[i] = 0;
+        }
+        if (stable && pe > HOWL_FAST_DOM*Etot && g[i] < HOWL_FAST_G) {
+          if (st->howl_fast[i] < HOWL_COUNT_MAX) st->howl_fast[i]++;
+        } else {
+          st->howl_fast[i] -= 2;
+          if (st->howl_fast[i] < 0) st->howl_fast[i] = 0;
+        }
+        st->howl_bin[i] = narrow ? pkb : -10;
+        if (st->howl_count[i] >= th || st->howl_fast[i] >= HOWL_FAST_TRIG) any_trig = 1;
+      }
+      if (any_trig) st->howl_mode_timer = HOWL_HOLD;
+      else if (st->howl_mode_timer > 0) st->howl_mode_timer--;
     }
-    
+
+    /* Far-field speech protection.
+       The model heavily attenuates reverberant/far-field speech (band gains drop
+       to 0.05~0.3) even while its own VAD still detects voice, and the raw VAD
+       fluctuates strongly from frame to frame on such speech.  So:
+       1) median-filter the VAD over 3 frames: transient noises (keyboard
+          clicks, taps) produce 1-2 frame VAD spikes that would otherwise open
+          the protection, while real speech keeps VAD up for many frames;
+       2) track a smoothed VAD with fast attack and ~50 ms release to avoid
+          gain pumping within words;
+       3) blend the band gains toward 1.0 in proportion to the smoothed VAD, so
+          frames classified as speech are preserved while noise-only frames
+          (vad ~ 0) keep the full suppression.
+       During howl mode, bands above ~1 kHz get no protection at all. */
+#define VAD_RELEASE 0.9f        /* per-10ms-frame release coefficient */
+#define VAD_PROTECT_SCALE 1.3f  /* >1: full protection already at vad_smooth ~ 0.77 */
+    {
+      float a = st->vad_hist[0], b = st->vad_hist[1], c = vad_prob;
+      float vad_med = a > b ? (b > c ? b : (a > c ? c : a))
+                            : (a > c ? a : (b > c ? c : b));
+      st->vad_hist[1] = st->vad_hist[0];
+      st->vad_hist[0] = vad_prob;
+      if (vad_med > st->vad_smooth) st->vad_smooth = vad_med;
+      else st->vad_smooth = VAD_RELEASE*st->vad_smooth + (1.f-VAD_RELEASE)*vad_med;
+    }
+    {
+      float protect = VAD_PROTECT_SCALE * st->vad_smooth;
+      if (protect > 1.f) protect = 1.f;
+      for (i=0;i<NB_BANDS;i++) {
+        float p = (st->howl_mode_timer > 0 && i >= HOWL_FIRST_BAND) ? 0.f : protect;
+        g[i] = g[i]*(1.f-p) + p;
+      }
+    }
 #endif
 
     //clock_t start_pitchfilter = clock();
